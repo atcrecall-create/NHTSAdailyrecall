@@ -63,40 +63,75 @@ EXCLUDE_CAMPNO_THIRD_CHAR = {"E"}
 #    normally just names the affected vehicles). Add or remove terms freely.
 EXCLUDE_TERMS = [
     # RVs / trailers
-    r"RVs?", r"recreational vehicles?", r"motor ?homes?", r"campers?", r"travel trailers?",
-    r"fifth[- ]wheels?", r"trailers?",
+    r"RVs?", r"recreational (?:vehicles?|trailers?)", r"motor ?homes?", r"campers?",
+    r"travel trailers?", r"fifth[- ]wheels?", r"trailers?", r"semi-?trailers?",
     # motorcycles
     r"motorcycles?", r"mopeds?", r"scooters?", r"trikes?",
-    # buses
-    r"(?<!can )(?<!data )bus(?:es)?", r"motor ?coach(?:es)?",
+    # buses and coaches
+    r"(?<!can )(?<!data )bus(?:es)?", r"motor ?coach(?:es)?", r"coach(?:es)?", r"cutaways?",
+    r"step vans?",
     # fire apparatus
     r"fire trucks?", r"fire engines?", r"fire apparatus", r"pumpers?", r"aerial ladders?",
+    # commercial trucks and tractors
+    r"commercial (?:trucks?|vehicles?|vans?|chassis)", r"medium[- ]duty", r"heavy[- ]duty trucks?",
+    r"truck[- ]tractors?", r"tractor[- ]trailers?", r"tractors?", r"terminal tractors?",
+    r"yard (?:trucks?|tractors?|jockeys?)", r"port tractors?", r"semi-?trucks?",
+    r"straight trucks?", r"dump trucks?", r"cement mixers?", r"tow trucks?", r"refuse trucks?",
+    r"garbage trucks?", r"chassis[- ]cabs?", r"custom chassis", r"incomplete vehicles?",
+    r"low cab forward", r"LCF", r"F-?(?:650|750)", r"[4-7]500 ?HD",
 ]
 # 3) Makers that only build those vehicles (their names often don't say "bus" or "trailer").
 EXCLUDE_MAKERS = [
+    # motorcycles
     "Harley-Davidson", "Ducati", "Triumph", "KTM", "Kawasaki", "Yamaha", "Aprilia", "Vespa",
     "Piaggio", "Royal Enfield", "Moto Guzzi", "Indian Motorcycle",
+    # RVs
     "Winnebago", "Thor", "Forest River", "Jayco", "Keystone", "Fleetwood", "Tiffin", "Newmar",
     "Airstream", "Coachmen", "Four Winds", "Gulf Stream", "Entegra", "Dutchmen", "Grand Design",
-    "Heartland", "Cruiser RV", "Prevost", "Blue Bird", "Thomas Built", "New Flyer", "Gillig",
-    "Motor Coach Industries", "Nova Bus", "Collins Bus", "Starcraft Bus",
+    "Heartland", "Cruiser RV", "Foretravel", "Roadtrek", "Pleasure-Way", "Leisure Travel Vans",
+    "Highland Ridge", "Alliance RV", "Brinkley", "Prime Time", "Northwood", "Riverside RV",
+    "Vanleigh", "Venture RV", "Starcraft",
+    # buses
+    "Prevost", "Blue Bird", "Thomas Built", "New Flyer", "Gillig", "Motor Coach Industries",
+    "Nova Bus", "Collins Bus", "Van Hool", "Proterra", "Lion Electric", "Beam Global",
+    # fire apparatus
     "Pierce", "E-One", "Sutphen", "Seagrave", "KME", "Rosenbauer", "Ferrara", "Spartan",
-    "Utility Trailer", "Wabash", "Great Dane", "Stoughton", "Fontaine",
+    # commercial trucks and tractors
+    "Daimler Trucks", "Freightliner", "Western Star", "Kenworth", "Peterbilt", "Mack Trucks",
+    "Volvo Trucks", "Volvo Group", "Navistar", "Hino", "Isuzu", "UD Trucks", "Autocar",
+    "Oshkosh", "Utilimaster", "Workhorse", "Kalmar", "Capacity of Texas", "Terberg",
+    "Ottawa Truck", "Crane Carrier", "Heil", "McNeilus", "Peterbilt Motors", "Paccar",
+    # trailers
+    "Utility Trailer", "Wabash", "Great Dane", "Stoughton", "Fontaine", "Big Tex", "PJ Trailers",
+    "Load Trail", "Carry-On Trailer", "Haulmark", "Pace American", "Wells Cargo", "Featherlite",
+    "Sundowner", "Trail King", "Fruehauf", "Dorsey", "Timpte", "Hyundai Translead",
 ]
+# Makes that are ambiguous as words but are truck makers when they are the whole make name.
+EXCLUDE_EXACT_MAKES = {"INTERNATIONAL", "MACK", "VOLVO TRUCKS", "AUTOCAR"}
+
 EXCLUDE_TERMS_RE = re.compile(r"\b(?:" + "|".join(EXCLUDE_TERMS) + r")\b", re.I)
 EXCLUDE_MAKERS_RE = re.compile(
     r"(?<![A-Za-z0-9])(?:" + "|".join(re.escape(m) for m in EXCLUDE_MAKERS) + r")(?![A-Za-z0-9])", re.I)
+ABBREV_RE = re.compile(r"\b(Inc|Co|Corp|Ltd|LLC|L\.L\.C|Cos|Mfg|Mfr|N\.A|U\.S|No)\.", re.I)
+
+
+def first_sentence_of(text):
+    """First sentence of the recall text, without stopping at 'Inc.', 'LLC.' etc."""
+    text = ABBREV_RE.sub(lambda m: m.group(1), text)
+    return re.split(r"(?<=[a-z0-9\)])\.\s", text, maxsplit=1)[0][:400]
 
 
 def is_excluded(campno, make, models, manufacturer, defect):
-    """True for equipment recalls (campaign no. 3rd char E) and RV/trailer/motorcycle/bus/fire-truck recalls."""
+    """True for equipment recalls (3rd char of campaign no. is E) and for recalls on RVs, trailers,
+    motorcycles, buses/coaches, fire trucks, commercial trucks and tractors."""
     if campno[2:3].upper() in EXCLUDE_CAMPNO_THIRD_CHAR:
+        return True
+    if make.strip().upper() in EXCLUDE_EXACT_MAKES:
         return True
     names = " ".join([make, manufacturer] + list(models))
     if EXCLUDE_MAKERS_RE.search(names):
         return True
-    first_sentence = re.split(r"(?<=[a-z0-9\)])\.\s", defect, maxsplit=1)[0][:300]
-    return bool(EXCLUDE_TERMS_RE.search(names + " " + first_sentence))
+    return bool(EXCLUDE_TERMS_RE.search(names + " " + first_sentence_of(defect)))
 
 
 # Column order of NHTSA's FLAT_RCL file (tab-delimited, no header row).
