@@ -58,9 +58,8 @@ DND_RE = re.compile(r"do\s*not\s*drive|don'?t\s*drive", re.I)
 # 1) Campaign numbers whose 3rd character is one of these (E = equipment recalls).
 EXCLUDE_CAMPNO_THIRD_CHAR = {"E"}
 
-# 2) Vehicle types. Matched (whole words, case-insensitive) against the make, model and
-#    manufacturer names, and the first sentence of the defect description (which
-#    normally just names the affected vehicles). Add or remove terms freely.
+# 2) Vehicle-type words. "Hard" terms exclude a recall if they appear in the make, model or
+#    manufacturer name, or in the first sentence of the recall text.
 EXCLUDE_TERMS = [
     # RVs / trailers
     r"RVs?", r"recreational (?:vehicles?|trailers?)", r"motor ?homes?", r"campers?",
@@ -68,16 +67,21 @@ EXCLUDE_TERMS = [
     # motorcycles
     r"motorcycles?", r"mopeds?", r"scooters?", r"trikes?",
     # buses and coaches
-    r"(?<!can )(?<!data )bus(?:es)?", r"motor ?coach(?:es)?", r"coach(?:es)?", r"cutaways?",
-    r"step vans?",
+    r"(?<!can )(?<!data )bus(?:es)?", r"motor ?coach(?:es)?", r"coach(?:es)?",
     # fire apparatus
     r"fire trucks?", r"fire engines?", r"fire apparatus", r"pumpers?", r"aerial ladders?",
     # commercial trucks and tractors
-    r"commercial (?:trucks?|vehicles?|vans?|chassis)", r"medium[- ]duty", r"heavy[- ]duty trucks?",
     r"truck[- ]tractors?", r"tractor[- ]trailers?", r"tractors?", r"terminal tractors?",
     r"yard (?:trucks?|tractors?|jockeys?)", r"port tractors?", r"semi-?trucks?",
     r"straight trucks?", r"dump trucks?", r"cement mixers?", r"tow trucks?", r"refuse trucks?",
-    r"garbage trucks?", r"chassis[- ]cabs?", r"custom chassis", r"incomplete vehicles?",
+    r"garbage trucks?",
+]
+# "Soft" terms are ambiguous because one campaign often covers many models, e.g. Ford's
+# F-150 through F-750. They exclude a recall only if EVERY model in it matches (so a recall
+# that includes pickups stays), or if the recall names a single model and its text matches.
+SOFT_TERMS = [
+    r"commercial (?:trucks?|vehicles?|vans?|chassis)", r"medium[- ]duty", r"heavy[- ]duty trucks?",
+    r"chassis[- ]cabs?", r"custom chassis", r"incomplete vehicles?", r"cutaways?", r"step vans?",
     r"low cab forward", r"LCF", r"F-?(?:650|750)", r"[4-7]500 ?HD",
 ]
 # 3) Makers that only build those vehicles (their names often don't say "bus" or "trailer").
@@ -110,6 +114,7 @@ EXCLUDE_MAKERS = [
 EXCLUDE_EXACT_MAKES = {"INTERNATIONAL", "MACK", "VOLVO TRUCKS", "AUTOCAR"}
 
 EXCLUDE_TERMS_RE = re.compile(r"\b(?:" + "|".join(EXCLUDE_TERMS) + r")\b", re.I)
+SOFT_TERMS_RE = re.compile(r"\b(?:" + "|".join(SOFT_TERMS) + r")\b", re.I)
 EXCLUDE_MAKERS_RE = re.compile(
     r"(?<![A-Za-z0-9])(?:" + "|".join(re.escape(m) for m in EXCLUDE_MAKERS) + r")(?![A-Za-z0-9])", re.I)
 ABBREV_RE = re.compile(r"\b(Inc|Co|Corp|Ltd|LLC|L\.L\.C|Cos|Mfg|Mfr|N\.A|U\.S|No)\.", re.I)
@@ -121,17 +126,31 @@ def first_sentence_of(text):
     return re.split(r"(?<=[a-z0-9\)])\.\s", text, maxsplit=1)[0][:400]
 
 
-def is_excluded(campno, make, models, manufacturer, defect):
-    """True for equipment recalls (3rd char of campaign no. is E) and for recalls on RVs, trailers,
-    motorcycles, buses/coaches, fire trucks, commercial trucks and tractors."""
+def exclusion_reason(campno, make, models, manufacturer, defect):
+    """Return a short reason string if this recall should be skipped, else None."""
     if campno[2:3].upper() in EXCLUDE_CAMPNO_THIRD_CHAR:
-        return True
+        return f"campaign number {campno} has '{campno[2:3]}' as its third character (equipment)"
     if make.strip().upper() in EXCLUDE_EXACT_MAKES:
-        return True
-    names = " ".join([make, manufacturer] + list(models))
-    if EXCLUDE_MAKERS_RE.search(names):
-        return True
-    return bool(EXCLUDE_TERMS_RE.search(names + " " + first_sentence_of(defect)))
+        return f"make '{make}' is on the excluded list"
+    models = [m for m in models if m.strip()]
+    names = " ".join([make, manufacturer] + models)
+    m = EXCLUDE_MAKERS_RE.search(names)
+    if m:
+        return f"maker name '{m.group(0)}' is on the excluded list"
+    sentence = first_sentence_of(defect)
+    m = EXCLUDE_TERMS_RE.search(names + " " + sentence)
+    if m:
+        return f"the word '{m.group(0)}' appears in the make/model/manufacturer or recall text"
+    if models and all(SOFT_TERMS_RE.search(x) or EXCLUDE_TERMS_RE.search(x) for x in models):
+        return "every model in the recall is a commercial/heavy-duty model"
+    if len(models) <= 1 and SOFT_TERMS_RE.search(sentence):
+        m = SOFT_TERMS_RE.search(sentence)
+        return f"the recall names one model and its text says '{m.group(0)}'"
+    return None
+
+
+def is_excluded(campno, make, models, manufacturer, defect):
+    return exclusion_reason(campno, make, models, manufacturer, defect) is not None
 
 
 # Column order of NHTSA's FLAT_RCL file (tab-delimited, no header row).
@@ -397,7 +416,33 @@ def send_email(new_hits, total_tracked, today):
 
 # ----------------------------------- main -----------------------------------
 
+def explain(campno):
+    """Print why a campaign is or isn't on the dashboard. Usage: recall_watch.py --explain 26V653"""
+    camps = group_by_campaign(download_rows())
+    c = camps.get(campno.strip().upper())
+    if not c:
+        print(f"{campno}: NOT FOUND in NHTSA's bulk file. It may be too new (the file updates daily), "
+              f"or the number is mistyped.")
+        return
+    print(f"Campaign:      {c['campno']}")
+    print(f"Make:          {c['make']}")
+    print(f"Manufacturer:  {c['manufacturer']}")
+    print(f"Models:        {', '.join(sorted(c['models']))[:300]}")
+    print(f"Vehicles:      {c['potaff']:,}")
+    print(f"Received:      {c['received']}    Added to file: {c['added']}")
+    print(f"Text starts:   {c['defect'][:250]}")
+    reason = exclusion_reason(c["campno"], c["make"], c["models"], c["manufacturer"], c["defect"])
+    print(f"Flags:         {flags_for(c) or 'none (would not be flagged)'}")
+    print(f"Excluded:      {'YES - ' + reason if reason else 'no'}")
+    seen = set(json.loads(SEEN_FILE.read_text())) if SEEN_FILE.exists() else set()
+    store = json.loads(STORE_FILE.read_text())["recalls"] if STORE_FILE.exists() else []
+    print(f"Already seen:  {c['campno'] in seen}    On dashboard: {any(r['campno'] == c['campno'] for r in store)}")
+
+
 def main():
+    if "--explain" in sys.argv:
+        explain(sys.argv[sys.argv.index("--explain") + 1])
+        return
     dry_run = "--dry-run" in sys.argv
     today = date.today()
 
@@ -418,9 +463,14 @@ def main():
     new_hits = []
     excluded = 0
     for no, c in camps.items():
+        if no in store:
+            continue                              # already on the dashboard
+        recent = (c["received"] or c["added"] or date.min) >= cutoff
         if no in seen:
-            continue
-        if first_run and not ((c["received"] or c["added"] or date.min) >= cutoff):
+            if not recent:
+                continue
+            # Recent but not on the dashboard: look again, in case the rules have changed.
+        elif first_run and not recent:
             continue
         if is_excluded(no, c["make"], c["models"], c["manufacturer"], c["defect"]):
             excluded += 1
