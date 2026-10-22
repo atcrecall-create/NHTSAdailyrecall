@@ -2,8 +2,13 @@ name: Update recall dashboard
 
 on:
   schedule:
-    - cron: "0 11 * * *"
-  workflow_dispatch:
+    - cron: "0 11 * * *"      # every day at 11:00 UTC (7am US Eastern during daylight time)
+  workflow_dispatch:           # lets you run it manually from the Actions tab
+    inputs:
+      explain:
+        description: "Optional: a campaign number (e.g. 26V653) to diagnose instead of doing a normal update"
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -20,11 +25,17 @@ jobs:
 
       - name: Check NHTSA and rebuild dashboard
         env:
+          # Email is optional. Delete these lines (and the secrets) to skip it.
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
           DASHBOARD_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/
-        run: python recall_watch.py
+        run: |
+          if [ -n "${{ inputs.explain }}" ]; then
+            python recall_watch.py --explain "${{ inputs.explain }}"
+          else
+            python recall_watch.py
+          fi
 
       - name: Save results
         run: |
