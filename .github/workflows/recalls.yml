@@ -1,0 +1,35 @@
+name: Update recall dashboard
+
+on:
+  schedule:
+    - cron: "0 11 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check NHTSA and rebuild dashboard
+        env:
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          DASHBOARD_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/
+        run: python recall_watch.py
+
+      - name: Save results
+        run: |
+          git config user.name "recall-watch"
+          git config user.email "recall-watch@users.noreply.github.com"
+          git add data docs
+          git diff --cached --quiet || git commit -m "Recall update $(date -u +%F)"
+          git push
