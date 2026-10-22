@@ -54,6 +54,51 @@ DASHBOARD_URL = os.environ.get("DASHBOARD_URL", "")
 FIRE_RE = re.compile(r"\bfires?\b", re.I)
 DND_RE = re.compile(r"do\s*not\s*drive|don'?t\s*drive", re.I)
 
+# ---- Exclusions: recalls matching any of these are skipped entirely ----
+# 1) Campaign numbers whose 3rd character is one of these (E = equipment recalls).
+EXCLUDE_CAMPNO_THIRD_CHAR = {"E"}
+
+# 2) Vehicle types. Matched (whole words, case-insensitive) against the make, model and
+#    manufacturer names, and the first sentence of the defect description (which
+#    normally just names the affected vehicles). Add or remove terms freely.
+EXCLUDE_TERMS = [
+    # RVs / trailers
+    r"RVs?", r"recreational vehicles?", r"motor ?homes?", r"campers?", r"travel trailers?",
+    r"fifth[- ]wheels?", r"trailers?",
+    # motorcycles
+    r"motorcycles?", r"mopeds?", r"scooters?", r"trikes?",
+    # buses
+    r"(?<!can )(?<!data )bus(?:es)?", r"motor ?coach(?:es)?",
+    # fire apparatus
+    r"fire trucks?", r"fire engines?", r"fire apparatus", r"pumpers?", r"aerial ladders?",
+]
+# 3) Makers that only build those vehicles (their names often don't say "bus" or "trailer").
+EXCLUDE_MAKERS = [
+    "Harley-Davidson", "Ducati", "Triumph", "KTM", "Kawasaki", "Yamaha", "Aprilia", "Vespa",
+    "Piaggio", "Royal Enfield", "Moto Guzzi", "Indian Motorcycle",
+    "Winnebago", "Thor", "Forest River", "Jayco", "Keystone", "Fleetwood", "Tiffin", "Newmar",
+    "Airstream", "Coachmen", "Four Winds", "Gulf Stream", "Entegra", "Dutchmen", "Grand Design",
+    "Heartland", "Cruiser RV", "Prevost", "Blue Bird", "Thomas Built", "New Flyer", "Gillig",
+    "Motor Coach Industries", "Nova Bus", "Collins Bus", "Starcraft Bus",
+    "Pierce", "E-One", "Sutphen", "Seagrave", "KME", "Rosenbauer", "Ferrara", "Spartan",
+    "Utility Trailer", "Wabash", "Great Dane", "Stoughton", "Fontaine",
+]
+EXCLUDE_TERMS_RE = re.compile(r"\b(?:" + "|".join(EXCLUDE_TERMS) + r")\b", re.I)
+EXCLUDE_MAKERS_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:" + "|".join(re.escape(m) for m in EXCLUDE_MAKERS) + r")(?![A-Za-z0-9])", re.I)
+
+
+def is_excluded(campno, make, models, manufacturer, defect):
+    """True for equipment recalls (campaign no. 3rd char E) and RV/trailer/motorcycle/bus/fire-truck recalls."""
+    if campno[2:3].upper() in EXCLUDE_CAMPNO_THIRD_CHAR:
+        return True
+    names = " ".join([make, manufacturer] + list(models))
+    if EXCLUDE_MAKERS_RE.search(names):
+        return True
+    first_sentence = re.split(r"(?<=[a-z0-9\)])\.\s", defect, maxsplit=1)[0][:300]
+    return bool(EXCLUDE_TERMS_RE.search(names + " " + first_sentence))
+
+
 # Column order of NHTSA's FLAT_RCL file (tab-delimited, no header row).
 COLS = [
     "RECORD_ID", "CAMPNO", "MAKETXT", "MODELTXT", "YEARTXT", "MFGCAMPNO",
@@ -134,6 +179,81 @@ def year_span(years):
     return ys[0] if ys[0] == ys[-1] else f"{ys[0]}\u2013{ys[-1]}"
 
 
+# ---- Injury / crash / fatality / fire / property-damage counts in the recall text ----
+NUM_WORDS = {w: i for i, w in enumerate(
+    "zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen "
+    "fifteen sixteen seventeen eighteen nineteen twenty".split())}
+NUM = r"(\d{1,3}(?:,\d{3})+|\d+|" + "|".join(NUM_WORDS) + r")"
+CATEGORIES = {
+    "injuries": re.compile(r"injur", re.I),
+    "crashes": re.compile(r"crash|collision|accident", re.I),
+    "fatalities": re.compile(r"fatalit|death|died|killed", re.I),
+    "fires": re.compile(r"\bfires?\b", re.I),
+    "property_damage": re.compile(r"property", re.I),
+}
+LABELS = {  # (singular, plural) used in the email summary
+    "injuries": ("injury", "injuries"), "crashes": ("crash", "crashes"),
+    "fatalities": ("fatality", "fatalities"), "fires": ("fire", "fires"),
+    "property_damage": ("property damage report", "property damage reports"),
+}
+# Words that mean the number is NOT a count of incidents ("85,000 vehicles may catch fire").
+STOP_WORDS = (r"vehicles|units|trucks|cars|may|might|could|can|will|would|should|must|to|that|which|"
+              r"who|if|when|but|however")
+COUNT_RE = re.compile(
+    r"\b" + NUM + r"\s+(?:(?!(?:" + STOP_WORDS + r")\b)[A-Za-z-]+\s+){0,3}?"
+    r"(injur\w*|crash\w*|collision\w*|accident\w*|fatalit\w*|death\w*|fires?\b|"
+    r"property\s+damage|damage\s+to\s+property)", re.I)
+NEGATION_RE = re.compile(r"\b(?:no|zero|none|not aware of any|not aware of)\b", re.I)
+REPORT_CONTEXT_RE = re.compile(r"aware|report|claim|incident|received", re.I)
+SPAN_END_RE = re.compile(r"\b(?:but|however|although|though|that|which|may|might|could|can|will|would|if)\b", re.I)
+
+
+def _to_number(tok):
+    tok = tok.lower().replace(",", "")
+    return NUM_WORDS[tok] if tok in NUM_WORDS else int(tok)
+
+
+def extract_incidents(text):
+    """Return counts for whatever the text states, e.g. {'injuries': 3, 'fires': 12}.
+    Categories the text doesn't mention are left out. 'No reports of injuries' gives 0."""
+    out = {}
+    for m in COUNT_RE.finditer(text):
+        raw = m.group(1)
+        if re.fullmatch(r"(19|20|21)\d\d", raw):      # a year, not a count
+            continue
+        n = _to_number(raw)
+        for cat, rx in CATEGORIES.items():
+            if rx.search(m.group(2)):
+                out[cat] = max(out.get(cat, 0), n)
+    for sent in re.split(r"(?<=[.;])\s+", text):
+        if not REPORT_CONTEXT_RE.search(sent):
+            continue
+        for neg in NEGATION_RE.finditer(sent):
+            tail = sent[neg.end():neg.end() + 140]
+            words = re.match(r"(?:\s*[A-Za-z-]+,?){1,10}", tail)
+            span = SPAN_END_RE.split(words.group(0))[0] if words else ""
+            if re.match(r"\s*(?:other|additional|further)\b", span, re.I):
+                continue
+            for cat, rx in CATEGORIES.items():
+                if cat not in out and rx.search(span):
+                    out[cat] = 0
+    return out
+
+
+def incidents_for(c):
+    return extract_incidents(" ".join([c["defect"], c["consequence"], c["remedy"], c["notes"]]))
+
+
+def incident_summary(inc):
+    return ", ".join(f"{inc[k]:,} {LABELS[k][0] if inc[k] == 1 else LABELS[k][1]}" for k in LABELS if k in inc)
+
+
+def posted_date(c, fallback):
+    """Date the recall was added to NHTSA's database (best available stand-in for the date it was posted)."""
+    d = c["added"] or c["received"]
+    return d.isoformat() if d else fallback.isoformat()
+
+
 def to_record(c, flags, first_seen):
     return {
         "campno": c["campno"],
@@ -144,6 +264,8 @@ def to_record(c, flags, first_seen):
         "manufacturer": c["manufacturer"],
         "potaff": c["potaff"],
         "received": c["received"].isoformat() if c["received"] else "",
+        "posted": posted_date(c, first_seen),
+        "incidents": incidents_for(c),
         "first_seen": first_seen.isoformat(),
         "defect": c["defect"][:1500],
         "consequence": c["consequence"][:1500],
@@ -155,7 +277,7 @@ def to_record(c, flags, first_seen):
 # -------------------------------- dashboard --------------------------------
 
 def write_dashboard(store, today):
-    recalls = sorted(store.values(), key=lambda r: (r["first_seen"], r["received"]), reverse=True)
+    recalls = sorted(store.values(), key=lambda r: (r.get("posted") or r["first_seen"], r["received"]), reverse=True)
     payload = {
         "generated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "today": today.isoformat(),
@@ -211,7 +333,10 @@ def send_email(new_hits, total_tracked, today):
                 f"padding:8px 12px;margin:8px 0'>{tags}"
                 f"<div style='font-weight:bold;margin-top:4px'>{escape(name(r))}</div>"
                 f"<div style='color:#555;font-size:14px'>{r['potaff']:,} vehicles &ndash; "
-                f"{escape(r['component'])}</div>"
+                f"{escape(r['component'])} &ndash; posted {r['posted']}</div>"
+                + (f"<div style='font-size:14px'>Reported: {incident_summary(r['incidents'])}</div>"
+                   if r.get('incidents') else "")
+                +
                 f"<div style='font-size:14px'><a href='{link(r)}'>View on NHTSA.gov</a></div></div>")
         if extra:
             h.append(f"<p>...and {extra} more on the dashboard.</p>")
@@ -244,23 +369,33 @@ def main():
     first_run = not SEEN_FILE.exists()
     seen = set() if first_run else set(json.loads(SEEN_FILE.read_text()))
     store = json.loads(STORE_FILE.read_text())["recalls"] if STORE_FILE.exists() else []
-    store = {r["campno"]: r for r in store}
+    store = {r["campno"]: r for r in store
+             if not is_excluded(r["campno"], r["make"], r["models"], r.get("manufacturer", ""), r["defect"])}
 
     camps = group_by_campaign(download_rows())
     print(f"Loaded {len(camps):,} campaigns from NHTSA.")
+    for no, rec in store.items():          # fill in / refresh posted dates on older entries
+        if no in camps:
+            rec["posted"] = posted_date(camps[no], date.fromisoformat(rec["first_seen"]))
+            rec["incidents"] = incidents_for(camps[no])
 
     cutoff = today - timedelta(days=BACKFILL_DAYS)
     new_hits = []
+    excluded = 0
     for no, c in camps.items():
         if no in seen:
             continue
         if first_run and not ((c["received"] or c["added"] or date.min) >= cutoff):
+            continue
+        if is_excluded(no, c["make"], c["models"], c["manufacturer"], c["defect"]):
+            excluded += 1
             continue
         flags = flags_for(c)
         if flags:
             rec = to_record(c, flags, today)
             store[no] = rec
             new_hits.append(rec)
+    print(f"{excluded} new recalls skipped (equipment, RV, trailer, motorcycle, bus, fire truck).")
     print(f"{len(new_hits)} new recalls matched your criteria.")
 
     write_dashboard(store, today)
@@ -349,7 +484,14 @@ HTML_TEMPLATE = r"""<!doctype html>
   .tag.dnd { background: var(--dnd); color: var(--on-dnd); }
   .tag.fire { background: var(--fire); color: var(--on-fire); }
   .tag.big { border-color: var(--big); color: var(--big); }
-  .tag.new { border-color: var(--ink); color: var(--ink); }
+  .tag.posted { border-color: var(--line); color: var(--muted); font-weight: 500; }
+  .tag.posted.fresh { background: var(--ink); border-color: var(--ink); color: var(--surface); font-weight: 600; }
+  .incidents { margin-top: 8px; border: 1px solid var(--line); border-radius: 4px; padding: 6px 10px;
+    font-size: 0.9rem; display: flex; gap: 6px 20px; flex-wrap: wrap; }
+  .incidents b { font-variant-numeric: tabular-nums; margin-left: 4px; }
+  .incidents .zero { color: var(--muted); }
+  .incidents .deadly b { color: var(--dnd); }
+  .incidents.none { color: var(--muted); }
   details { margin-top: 8px; }
   summary { cursor: pointer; color: var(--muted); font-size: 0.9rem; }
   details p { margin: 8px 0 0; max-width: 70ch; font-size: 0.95rem; }
@@ -414,6 +556,10 @@ function dayLabel(iso) {
   const d = new Date(iso + "T12:00:00");
   return d.toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric", year: "numeric" });
 }
+function postedOf(r) { return r.posted || r.received || r.first_seen; }
+function shortDate(iso) {
+  return new Date(iso + "T12:00:00").toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+}
 function sev(r) { return r.flags.includes("dnd") ? 3 : r.flags.includes("fire") ? 2 : 1; }
 function topFlag(r) { return r.flags.includes("dnd") ? "dnd" : r.flags.includes("fire") ? "fire" : "big"; }
 const TAG_TEXT = { dnd: "Do not drive", fire: "Fire risk", big: "Over " + fmt.format(DATA.threshold) + " vehicles" };
@@ -437,8 +583,23 @@ function buildRow(r) {
 
   const tags = el("div", "tags");
   r.flags.forEach(f => tags.append(el("span", "tag " + f, TAG_TEXT[f])));
-  if (r.first_seen === DATA.today) tags.append(el("span", "tag new", "New today"));
+  tags.append(el("span", "tag posted" + (r.first_seen === DATA.today ? " fresh" : ""), "Posted " + shortDate(postedOf(r))));
   row.append(tags);
+
+  const inc = r.incidents || {};
+  const labels = [["injuries", "Injuries"], ["crashes", "Crashes"], ["fatalities", "Fatalities"], ["fires", "Fires"], ["property_damage", "Property damage"]];
+  const found = labels.filter(([k]) => k in inc);
+  const box = el("div", "incidents" + (found.length ? "" : " none"));
+  if (found.length) {
+    found.forEach(([k, label]) => {
+      const item = el("span", inc[k] === 0 ? "zero" : (k === "fatalities" ? "deadly" : ""));
+      item.append(document.createTextNode(label), el("b", null, fmt.format(inc[k])));
+      box.append(item);
+    });
+  } else {
+    box.textContent = "No injury, crash, fatality, fire or property damage counts in the recall text";
+  }
+  row.append(box);
 
   const det = el("details");
   det.append(el("summary", null, "What\u2019s wrong and what to do"));
@@ -456,7 +617,7 @@ function render() {
     (state.flags.size === 0 || r.flags.some(f => state.flags.has(f))) &&
     (!q || (r.make + " " + r.models.join(" ") + " " + r.component + " " + r.manufacturer).toLowerCase().includes(q)));
   const cmp = {
-    new: (a, b) => b.first_seen.localeCompare(a.first_seen) || b.received.localeCompare(a.received),
+    new: (a, b) => postedOf(b).localeCompare(postedOf(a)) || b.received.localeCompare(a.received),
     count: (a, b) => b.potaff - a.potaff,
     severity: (a, b) => sev(b) - sev(a) || b.potaff - a.potaff,
   }[state.sort];
@@ -475,9 +636,9 @@ function render() {
   }
   let lastDay = null;
   items.forEach(r => {
-    if (state.sort === "new" && r.first_seen !== lastDay) {
-      lastDay = r.first_seen;
-      const n = items.filter(x => x.first_seen === lastDay).length;
+    if (state.sort === "new" && postedOf(r) !== lastDay) {
+      lastDay = postedOf(r);
+      const n = items.filter(x => postedOf(x) === lastDay).length;
       list.append(el("h2", "day", dayLabel(lastDay) + " \u2013 " + n + (n === 1 ? " recall" : " recalls")));
     }
     list.append(buildRow(r));
